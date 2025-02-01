@@ -1,10 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Sat Feb  1 10:03:33 2025
-
-@author: kushp
-"""
-
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -172,63 +165,85 @@ class SecondDerivativeMAStrategy(Strategy):
         return signals
 
 # ------------------------------
-# Options Strategies (Simplified Simulation)
+# Options Strategies (Simplified Simulation with Actual Options Data)
 # ------------------------------
 
 class WheelStrategyOptions(Strategy):
     """
-    A very simplified simulation of the Wheel strategy.
-    When not holding stock, sell a cash‑secured put; if assigned, switch to stock-owned
-    and then sell a covered call.
-    The simulation uses a “holding period” (in days) to model option expiration outcomes.
+    Wheel Strategy (Options) – now using actual options chain data.
+    
+    When not holding stock, the strategy sells a cash‑secured put.
+    It fetches the current options chain for the chosen ticker and expiration date,
+    selects a put whose strike is close to a target (e.g. price*(1 - put_offset)),
+    and uses its actual last price as the premium.
+    
+    If assigned (i.e. if at expiration the underlying is below the option's strike),
+    the strategy buys stock (at the strike) and then sells a covered call using the
+    current call options chain data.
+    
+    Note: This implementation uses current options data from yfinance.
     """
-    def __init__(self, put_offset=0.05, call_offset=0.05, put_premium_rate=0.02,
-                 call_premium_rate=0.02, holding_period=5, shares=100):
+    def __init__(self, put_offset=0.05, call_offset=0.05, holding_period=5, shares=100):
         self.put_offset = put_offset
         self.call_offset = call_offset
-        self.put_premium_rate = put_premium_rate
-        self.call_premium_rate = call_premium_rate
         self.holding_period = holding_period
         self.shares = shares
 
-    def simulate(self, data: pd.DataFrame, initial_capital: float) -> pd.DataFrame:
+    def simulate(self, data: pd.DataFrame, ticker: str, initial_capital: float) -> pd.DataFrame:
+        # Retrieve current options chain for a chosen expiration date
+        tkr = yf.Ticker(ticker)
+        option_dates = tkr.options
+        if not option_dates:
+            raise ValueError("No options data available for ticker.")
+        exp_date = option_dates[0]  # For demonstration, choose the earliest expiration
+        chain = tkr.option_chain(exp_date)
+        puts = chain.puts
+        calls = chain.calls
+
         cash = initial_capital
-        state = "no_stock"  # possible states: "no_stock" or "stock_owned"
+        state = "no_stock"  # "no_stock" or "stock_owned"
         entry_price = None
         portfolio_values = []
         dates = data.index
         i = 0
         while i < len(dates):
-            price = data['Close'].iloc[i]
+            price = float(data['Close'].iloc[i])
             if state == "no_stock":
-                # Sell put option
-                strike = price * (1 - self.put_offset)
-                premium = price * self.put_premium_rate
+                # Sell put: target strike is price*(1 - put_offset)
+                desired_strike = price * (1 - self.put_offset)
+                idx = (puts['strike'] - desired_strike).abs().idxmin()
+                chosen_put = puts.loc[idx]
+                premium = float(chosen_put['lastPrice'])
                 cash += premium * self.shares
+                # Determine expiration outcome using the underlying's price after holding_period days
                 if i + self.holding_period < len(dates):
-                    exp_price = data['Close'].iloc[i + self.holding_period]
+                    exp_price = float(data['Close'].iloc[i + self.holding_period])
                 else:
                     exp_price = price
-                if exp_price < strike:
-                    cost = strike * self.shares
+                # If the underlying is below the option's strike, assignment occurs
+                if exp_price < chosen_put['strike']:
+                    cost = chosen_put['strike'] * self.shares
                     if cash >= cost:
                         cash -= cost
                         state = "stock_owned"
-                        entry_price = strike
+                        entry_price = chosen_put['strike']
             elif state == "stock_owned":
-                # Sell covered call
-                strike = entry_price * (1 + self.call_offset)
-                premium = price * self.call_premium_rate
+                # Sell covered call: target strike is entry_price*(1 + call_offset)
+                desired_strike = entry_price * (1 + self.call_offset)
+                idx = (calls['strike'] - desired_strike).abs().idxmin()
+                chosen_call = calls.loc[idx]
+                premium_call = float(chosen_call['lastPrice'])
                 if i + self.holding_period < len(dates):
-                    exp_price = data['Close'].iloc[i + self.holding_period]
+                    exp_price = float(data['Close'].iloc[i + self.holding_period])
                 else:
                     exp_price = price
-                cash += premium * self.shares
-                if exp_price > strike:
-                    cash += strike * self.shares
+                cash += premium_call * self.shares
+                # If the underlying is above the call's strike at expiration, assignment occurs
+                if exp_price > chosen_call['strike']:
+                    cash += chosen_call['strike'] * self.shares
                     state = "no_stock"
                     entry_price = None
-            portfolio_value = cash if state == "no_stock" else cash + data['Close'].iloc[i] * self.shares
+            portfolio_value = cash if state == "no_stock" else cash + float(data['Close'].iloc[i]) * self.shares
             portfolio_values.append(portfolio_value)
             i += 1
         portfolio = pd.DataFrame(index=dates, data={'total': portfolio_values})
@@ -237,35 +252,49 @@ class WheelStrategyOptions(Strategy):
 
 class CreditSpreadsStrategyOptions(Strategy):
     """
-    A simplified simulation of a credit spreads strategy.
-    Here we assume a put credit spread is sold on a weekly basis.
-    Profit is the premium if the option expires worthless; otherwise, a loss equal to
-    (spread_width - premium) is assumed.
+    Credit Spreads Strategy (Options) – using actual options data.
+    
+    This simplified simulation assumes a put credit spread is sold.
+    It fetches the current puts chain, selects a put near the target strike,
+    and uses its actual last price as the premium.
+    
+    The profit is the premium if the option expires worthless; otherwise,
+    a loss equal to (spread_width - premium) is assumed.
     """
-    def __init__(self, spread_width=5.0, spread_offset=0.05, premium_rate=0.02, holding_period=5):
+    def __init__(self, spread_width=5.0, spread_offset=0.05, holding_period=5):
         self.spread_width = spread_width
         self.spread_offset = spread_offset
-        self.premium_rate = premium_rate
         self.holding_period = holding_period
 
-    def simulate(self, data: pd.DataFrame, initial_capital: float) -> pd.DataFrame:
+    def simulate(self, data: pd.DataFrame, ticker: str, initial_capital: float) -> pd.DataFrame:
+        tkr = yf.Ticker(ticker)
+        option_dates = tkr.options
+        if not option_dates:
+            raise ValueError("No options data available for ticker.")
+        exp_date = option_dates[0]
+        chain = tkr.option_chain(exp_date)
+        puts = chain.puts
+
         cash = initial_capital
         portfolio_values = []
         dates = data.index
         i = 0
         while i < len(dates):
-            price = data['Close'].iloc[i]
-            strike = price * (1 - self.spread_offset)
-            premium = price * self.premium_rate
+            price = float(data['Close'].iloc[i])
+            desired_strike = price * (1 - self.spread_offset)
+            idx = (puts['strike'] - desired_strike).abs().idxmin()
+            chosen_put = puts.loc[idx]
+            premium = float(chosen_put['lastPrice'])
             if i + self.holding_period < len(dates):
-                exp_price = data['Close'].iloc[i + self.holding_period]
+                exp_price = float(data['Close'].iloc[i + self.holding_period])
             else:
                 exp_price = price
-            if exp_price > strike:
+            if exp_price > chosen_put['strike']:
                 profit = premium
             else:
                 profit = - (self.spread_width - premium)
             cash += profit
+            # Fill in the portfolio for holding_period days
             for j in range(self.holding_period):
                 portfolio_values.append(cash)
             i += self.holding_period
@@ -276,46 +305,65 @@ class CreditSpreadsStrategyOptions(Strategy):
 
 class IronCondorsStrategyOptions(Strategy):
     """
-    A simplified simulation of an Iron Condor strategy.
-    Two credit spreads (one put and one call) are sold.
-    If the underlying remains between the inner strikes at expiration,
-    the full premium is kept; otherwise, a maximum loss is assumed.
+    Iron Condors Strategy (Options) – using actual options data.
+    
+    This simplified simulation sells both a put spread and a call spread.
+    It fetches the current puts and calls chains, selects options near the target inner strikes,
+    and uses their actual last prices as premiums.
+    
+    If the underlying remains between the inner strikes at expiration, full premium is kept;
+    otherwise, a loss is incurred approximated by the difference between outer and inner strikes minus premium.
     """
     def __init__(self, lower_put_offset=0.05, upper_call_offset=0.05,
-                 inner_put_offset=0.02, inner_call_offset=0.02,
-                 premium_rate=0.02, holding_period=5):
+                 inner_put_offset=0.02, inner_call_offset=0.02, holding_period=5):
         self.lower_put_offset = lower_put_offset
         self.upper_call_offset = upper_call_offset
         self.inner_put_offset = inner_put_offset
         self.inner_call_offset = inner_call_offset
-        self.premium_rate = premium_rate
         self.holding_period = holding_period
 
-    def simulate(self, data: pd.DataFrame, initial_capital: float) -> pd.DataFrame:
+    def simulate(self, data: pd.DataFrame, ticker: str, initial_capital: float) -> pd.DataFrame:
+        tkr = yf.Ticker(ticker)
+        option_dates = tkr.options
+        if not option_dates:
+            raise ValueError("No options data available for ticker.")
+        exp_date = option_dates[0]
+        chain = tkr.option_chain(exp_date)
+        puts = chain.puts
+        calls = chain.calls
+
         cash = initial_capital
         portfolio_values = []
         dates = data.index
         i = 0
         while i < len(dates):
-            price = data['Close'].iloc[i]
-            lower_inner = price * (1 - self.inner_put_offset)
-            upper_inner = price * (1 + self.inner_call_offset)
-            lower_outer = price * (1 - self.lower_put_offset)
-            upper_outer = price * (1 + self.upper_call_offset)
-            premium = price * self.premium_rate
+            price = float(data['Close'].iloc[i])
+            inner_put_target = price * (1 - self.inner_put_offset)
+            inner_call_target = price * (1 + self.inner_call_offset)
+            outer_put_target = price * (1 - self.lower_put_offset)
+            outer_call_target = price * (1 + self.upper_call_offset)
+            
+            idx_put = (puts['strike'] - inner_put_target).abs().idxmin()
+            chosen_put = puts.loc[idx_put]
+            idx_call = (calls['strike'] - inner_call_target).abs().idxmin()
+            chosen_call = calls.loc[idx_call]
+            
+            premium_put = float(chosen_put['lastPrice'])
+            premium_call = float(chosen_call['lastPrice'])
+            total_premium = premium_put + premium_call
+            
             if i + self.holding_period < len(dates):
-                exp_price = data['Close'].iloc[i + self.holding_period]
+                exp_price = float(data['Close'].iloc[i + self.holding_period])
             else:
                 exp_price = price
-            if lower_inner <= exp_price <= upper_inner:
-                profit = premium
+            
+            if (exp_price >= chosen_put['strike']) and (exp_price <= chosen_call['strike']):
+                profit = total_premium
             else:
-                if exp_price < lower_inner:
-                    loss = (lower_inner - lower_outer) - premium
-                    profit = -loss
-                elif exp_price > upper_inner:
-                    loss = (upper_outer - upper_inner) - premium
-                    profit = -loss
+                loss_put = (chosen_put['strike'] - outer_put_target) if exp_price < chosen_put['strike'] else 0
+                loss_call = (outer_call_target - chosen_call['strike']) if exp_price > chosen_call['strike'] else 0
+                profit = total_premium - (loss_put + loss_call)
+            
             cash += profit
             for j in range(self.holding_period):
                 portfolio_values.append(cash)
@@ -344,16 +392,11 @@ class Backtester:
         self.shares = shares
 
     def run_backtest(self) -> pd.DataFrame:
-        # Build positions DataFrame: number of shares held
         positions = pd.DataFrame(index=self.signals.index).fillna(0.0)
         positions['positions'] = self.shares * self.signals['signal']
-
-        # Ensure that "Close" is a Series. If it is a DataFrame, squeeze it.
         close_prices = self.data['Close']
         if isinstance(close_prices, pd.DataFrame):
             close_prices = close_prices.squeeze()
-
-        # Calculate portfolio value over time
         portfolio = pd.DataFrame(index=self.signals.index)
         portfolio['holdings'] = positions['positions'] * close_prices
         pos_diff = positions['positions'].diff().fillna(0.0)
@@ -394,15 +437,34 @@ class Backtester:
         return portfolio
 
 # ------------------------------
-# Visualization
+# Visualization Functions
 # ------------------------------
 
 def plot_results(portfolio: pd.DataFrame):
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(portfolio.index, portfolio['total'], label="Portfolio Total Value")
+    ax.plot(portfolio.index, portfolio['total'], label="Strategy Portfolio")
     ax.set_title("Portfolio Performance")
     ax.set_xlabel("Date")
     ax.set_ylabel("Total Value")
+    ax.legend()
+    ax.grid(True)
+    return fig
+
+def plot_buy_hold_comparison(portfolio: pd.DataFrame, data: pd.DataFrame, initial_capital: float):
+    """
+    Computes a buy and hold strategy and plots its portfolio value alongside the strategy portfolio.
+    Buy and hold: invest the entire initial capital at the first close.
+    """
+    # Calculate buy and hold portfolio value
+    bh_shares = initial_capital / data['Close'].iloc[0]
+    buy_hold = bh_shares * data['Close']
+    
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(portfolio.index, portfolio['total'], label="Strategy Portfolio")
+    ax.plot(data.index, buy_hold, label="Buy & Hold", linestyle='--')
+    ax.set_title("Strategy vs. Buy & Hold Comparison")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Portfolio Value")
     ax.legend()
     ax.grid(True)
     return fig
@@ -487,37 +549,32 @@ def main():
         st.sidebar.subheader("Wheel Strategy Parameters")
         put_offset = st.sidebar.slider("Put Offset (%)", min_value=1, max_value=10, value=5) / 100.0
         call_offset = st.sidebar.slider("Call Offset (%)", min_value=1, max_value=10, value=5) / 100.0
-        put_premium_rate = st.sidebar.slider("Put Premium Rate (%)", min_value=1, max_value=10, value=2) / 100.0
-        call_premium_rate = st.sidebar.slider("Call Premium Rate (%)", min_value=1, max_value=10, value=2) / 100.0
         holding_period = st.sidebar.slider("Holding Period (days)", min_value=1, max_value=30, value=5)
-        strategy = WheelStrategyOptions(put_offset, call_offset, put_premium_rate,
-                                        call_premium_rate, holding_period, shares)
+        strategy = WheelStrategyOptions(put_offset, call_offset, holding_period=holding_period, shares=shares)
         if st.sidebar.button("Run Backtest"):
             with st.spinner("Running Wheel Strategy simulation..."):
-                portfolio = strategy.simulate(data, initial_capital)
+                portfolio = strategy.simulate(data, ticker, initial_capital)
     elif selected_strategy == "Credit Spreads":
         st.sidebar.subheader("Credit Spreads Parameters")
         spread_width = st.sidebar.number_input("Spread Width", value=5.0)
         spread_offset = st.sidebar.slider("Spread Offset (%)", min_value=1, max_value=10, value=5) / 100.0
-        premium_rate = st.sidebar.slider("Premium Rate (%)", min_value=1, max_value=10, value=2) / 100.0
         holding_period = st.sidebar.slider("Holding Period (days)", min_value=1, max_value=30, value=5)
-        strategy = CreditSpreadsStrategyOptions(spread_width, spread_offset, premium_rate, holding_period)
+        strategy = CreditSpreadsStrategyOptions(spread_width, spread_offset, holding_period=holding_period)
         if st.sidebar.button("Run Backtest"):
             with st.spinner("Running Credit Spreads simulation..."):
-                portfolio = strategy.simulate(data, initial_capital)
+                portfolio = strategy.simulate(data, ticker, initial_capital)
     elif selected_strategy == "Iron Condors":
         st.sidebar.subheader("Iron Condors Parameters")
         lower_put_offset = st.sidebar.slider("Lower Put Offset (%)", min_value=1, max_value=10, value=5) / 100.0
         upper_call_offset = st.sidebar.slider("Upper Call Offset (%)", min_value=1, max_value=10, value=5) / 100.0
         inner_put_offset = st.sidebar.slider("Inner Put Offset (%)", min_value=1, max_value=10, value=2) / 100.0
         inner_call_offset = st.sidebar.slider("Inner Call Offset (%)", min_value=1, max_value=10, value=2) / 100.0
-        premium_rate = st.sidebar.slider("Premium Rate (%)", min_value=1, max_value=10, value=2) / 100.0
         holding_period = st.sidebar.slider("Holding Period (days)", min_value=1, max_value=30, value=5)
         strategy = IronCondorsStrategyOptions(lower_put_offset, upper_call_offset, inner_put_offset,
-                                               inner_call_offset, premium_rate, holding_period)
+                                               inner_call_offset, holding_period=holding_period)
         if st.sidebar.button("Run Backtest"):
             with st.spinner("Running Iron Condors simulation..."):
-                portfolio = strategy.simulate(data, initial_capital)
+                portfolio = strategy.simulate(data, ticker, initial_capital)
 
     # ------------------------------
     # Results & Visualization
@@ -539,9 +596,11 @@ def main():
             "Sharpe Ratio": f"{sharpe:.2f}"
         })
         st.subheader("Portfolio Performance")
-        fig = plot_results(portfolio)
-        st.pyplot(fig)
+        fig1 = plot_results(portfolio)
+        st.pyplot(fig1)
+        st.subheader("Strategy vs. Buy & Hold Comparison")
+        fig2 = plot_buy_hold_comparison(portfolio, data, initial_capital)
+        st.pyplot(fig2)
 
 if __name__ == "__main__":
     main()
-
